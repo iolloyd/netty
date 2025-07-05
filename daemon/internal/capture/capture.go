@@ -8,16 +8,21 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"github.com/iolloyd/netty/daemon/internal/conversation"
 	"github.com/iolloyd/netty/daemon/internal/models"
+	"github.com/iolloyd/netty/daemon/internal/parser"
+	"github.com/iolloyd/netty/daemon/internal/resolver"
 )
 
 type PacketCapture struct {
-	handle *pcap.Handle
-	iface  string
-	filter string
+	handle      *pcap.Handle
+	iface       string
+	filter      string
+	convMgr     *conversation.Manager
+	dnsResolver *resolver.DNSResolver
 }
 
-func NewPacketCapture(iface, filter string) (*PacketCapture, error) {
+func NewPacketCapture(iface, filter, localIP string) (*PacketCapture, error) {
 	handle, err := pcap.OpenLive(iface, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open interface %s: %w", iface, err)
@@ -30,10 +35,20 @@ func NewPacketCapture(iface, filter string) (*PacketCapture, error) {
 		}
 	}
 
+	// Create conversation manager with local IP
+	convMgr := conversation.NewManager(localIP)
+	convMgr.StartCleanupRoutine()
+
+	// Create DNS resolver with 5 minute TTL
+	dnsResolver := resolver.NewDNSResolver(5 * time.Minute)
+	dnsResolver.StartCleanup(time.Minute)
+
 	return &PacketCapture{
-		handle: handle,
-		iface:  iface,
-		filter: filter,
+		handle:      handle,
+		iface:       iface,
+		filter:      filter,
+		convMgr:     convMgr,
+		dnsResolver: dnsResolver,
 	}, nil
 }
 
@@ -47,6 +62,9 @@ func (pc *PacketCapture) Start() <-chan *models.NetworkEvent {
 		for packet := range packetSource.Packets() {
 			event := pc.processPacket(packet)
 			if event != nil {
+				// Process packet through conversation manager
+				pc.convMgr.ProcessEvent(event)
+				
 				select {
 				case events <- event:
 				default:
@@ -87,6 +105,20 @@ func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEv
 			event.SourcePort = int(trans.SrcPort)
 			event.DestPort = int(trans.DstPort)
 			
+			// Extract TCP flags
+			event.TCPFlags = &models.TCPPacketFlags{
+				SYN: trans.SYN,
+				ACK: trans.ACK,
+				FIN: trans.FIN,
+				RST: trans.RST,
+				PSH: trans.PSH,
+				URG: trans.URG,
+			}
+			
+			// Extract sequence and acknowledgment numbers
+			event.SequenceNumber = trans.Seq
+			event.AckNumber = trans.Ack
+			
 			// Determine direction based on SYN/ACK flags
 			if trans.SYN && !trans.ACK {
 				event.Direction = "outgoing"
@@ -100,6 +132,15 @@ func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEv
 					event.Direction = "incoming"
 				} else {
 					event.Direction = "unknown"
+				}
+			}
+			
+			// Try to extract TLS SNI if this is HTTPS traffic
+			if trans.DstPort == 443 || trans.SrcPort == 443 {
+				if payload := trans.LayerPayload(); len(payload) > 0 {
+					if sni := parser.ExtractSNI(payload); sni != "" {
+						event.TLSServerName = sni
+					}
 				}
 			}
 		case *layers.UDP:
@@ -126,6 +167,12 @@ func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEv
 		event.AppProtocol = guessAppProtocol(event.SourcePort, event.DestPort)
 	}
 
+	// Perform DNS resolution (using cached results when available)
+	if event.SourceIP != "" && event.DestIP != "" {
+		event.SourceHostname = pc.dnsResolver.ResolveIP(event.SourceIP)
+		event.DestHostname = pc.dnsResolver.ResolveIP(event.DestIP)
+	}
+
 	return event
 }
 
@@ -133,6 +180,12 @@ func (pc *PacketCapture) Close() {
 	if pc.handle != nil {
 		pc.handle.Close()
 	}
+	// Conversation manager cleanup is handled by its goroutine
+}
+
+// GetConversationManager returns the conversation manager
+func (pc *PacketCapture) GetConversationManager() *conversation.Manager {
+	return pc.convMgr
 }
 
 func isCommonPort(port int) bool {

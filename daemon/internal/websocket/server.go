@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/iolloyd/netty/daemon/internal/conversation"
 	"github.com/iolloyd/netty/daemon/internal/models"
 )
 
@@ -18,6 +19,7 @@ type Server struct {
 	unregister chan *Client
 	upgrader  websocket.Upgrader
 	mu        sync.RWMutex
+	convMgr   *conversation.Manager
 }
 
 type Client struct {
@@ -43,11 +45,18 @@ func NewServer(port string) *Server {
 	}
 }
 
+// SetConversationManager sets the conversation manager for the server
+func (s *Server) SetConversationManager(mgr *conversation.Manager) {
+	s.convMgr = mgr
+}
+
 func (s *Server) Start() error {
 	go s.run()
 
 	http.HandleFunc("/ws", s.handleWebSocket)
 	http.HandleFunc("/health", s.handleHealth)
+	http.HandleFunc("/api/conversations", s.handleConversations)
+	http.HandleFunc("/api/conversations/summary", s.handleConversationSummary)
 
 	log.Printf("WebSocket server starting on port %s", s.port)
 	return http.ListenAndServe(":"+s.port, nil)
@@ -130,7 +139,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Broadcast(event *models.NetworkEvent) {
-	data, err := json.Marshal(event)
+	// Wrap event in a message type
+	message := struct {
+		Type string               `json:"type"`
+		Data *models.NetworkEvent `json:"data"`
+	}{
+		Type: "network_event",
+		Data: event,
+	}
+
+	data, err := json.Marshal(message)
 	if err != nil {
 		log.Printf("Failed to marshal event: %v", err)
 		return
@@ -143,6 +161,38 @@ func (s *Server) Broadcast(event *models.NetworkEvent) {
 	}
 }
 
+// BroadcastConversationUpdate sends conversation updates to all clients
+func (s *Server) BroadcastConversationUpdate(conversationID string) {
+	if s.convMgr == nil {
+		return
+	}
+
+	conv, exists := s.convMgr.GetConversation(conversationID)
+	if !exists {
+		return
+	}
+
+	message := struct {
+		Type string                  `json:"type"`
+		Data *models.Conversation    `json:"data"`
+	}{
+		Type: "conversation_update",
+		Data: conv,
+	}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Failed to marshal conversation update: %v", err)
+		return
+	}
+
+	select {
+	case s.broadcast <- data:
+	default:
+		log.Println("Broadcast channel full, dropping conversation update")
+	}
+}
+
 func (c *Client) readPump() {
 	defer func() {
 		c.server.unregister <- c
@@ -151,12 +201,96 @@ func (c *Client) readPump() {
 
 	for {
 		// Read message from client (for ping/pong and potential future commands)
-		_, _, err := c.conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			break
+		}
+		
+		// Handle client commands
+		c.handleCommand(message)
+	}
+}
+
+// handleCommand processes commands from clients
+func (c *Client) handleCommand(message []byte) {
+	var cmd struct {
+		Type string `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	
+	if err := json.Unmarshal(message, &cmd); err != nil {
+		return // Ignore malformed messages
+	}
+	
+	switch cmd.Type {
+	case "get_conversations":
+		// Send active conversations to this client
+		if c.server.convMgr != nil {
+			conversations := c.server.convMgr.GetActiveConversations()
+			response := struct {
+				Type string `json:"type"`
+				Data interface{} `json:"data"`
+			}{
+				Type: "conversations",
+				Data: conversations,
+			}
+			
+			if data, err := json.Marshal(response); err == nil {
+				select {
+				case c.send <- data:
+				default:
+					// Client send channel full
+				}
+			}
+		}
+	
+	case "get_conversation_summaries":
+		// Send conversation summaries to this client
+		if c.server.convMgr != nil {
+			summaries := c.server.convMgr.GetConversationSummaries()
+			response := struct {
+				Type string `json:"type"`
+				Data interface{} `json:"data"`
+			}{
+				Type: "conversation_summaries",
+				Data: summaries,
+			}
+			
+			if data, err := json.Marshal(response); err == nil {
+				select {
+				case c.send <- data:
+				default:
+					// Client send channel full
+				}
+			}
+		}
+	
+	case "get_conversation":
+		// Get specific conversation by ID
+		var params struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(cmd.Data, &params); err == nil && c.server.convMgr != nil {
+			if conv, exists := c.server.convMgr.GetConversation(params.ID); exists {
+				response := struct {
+					Type string `json:"type"`
+					Data interface{} `json:"data"`
+				}{
+					Type: "conversation",
+					Data: conv,
+				}
+				
+				if data, err := json.Marshal(response); err == nil {
+					select {
+					case c.send <- data:
+					default:
+						// Client send channel full
+					}
+				}
+			}
 		}
 	}
 }
@@ -175,4 +309,32 @@ func (c *Client) writePump() {
 			c.conn.WriteMessage(websocket.TextMessage, message)
 		}
 	}
+}
+
+// handleConversations handles HTTP API requests for conversations
+func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
+	if s.convMgr == nil {
+		http.Error(w, "Conversation manager not initialized", http.StatusInternalServerError)
+		return
+	}
+	
+	conversations := s.convMgr.GetActiveConversations()
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // CORS for development
+	json.NewEncoder(w).Encode(conversations)
+}
+
+// handleConversationSummary handles HTTP API requests for conversation summary
+func (s *Server) handleConversationSummary(w http.ResponseWriter, r *http.Request) {
+	if s.convMgr == nil {
+		http.Error(w, "Conversation manager not initialized", http.StatusInternalServerError)
+		return
+	}
+	
+	summaries := s.convMgr.GetConversationSummaries()
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // CORS for development
+	json.NewEncoder(w).Encode(summaries)
 }

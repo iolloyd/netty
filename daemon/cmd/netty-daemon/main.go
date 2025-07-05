@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,8 +35,17 @@ func main() {
 		}
 	}
 
+	// Get local IP address for the specified interface
+	localIP, err := getLocalIP(*iface)
+	if err != nil {
+		log.Fatalf("Failed to get local IP for interface %s: %v", *iface, err)
+	}
+	if *verbose {
+		log.Printf("Local IP: %s", localIP)
+	}
+
 	// Create packet capture instance
-	capturer, err := capture.NewPacketCapture(*iface, *filter)
+	capturer, err := capture.NewPacketCapture(*iface, *filter, localIP)
 	if err != nil {
 		log.Fatalf("Failed to create packet capture: %v", err)
 	}
@@ -42,6 +53,9 @@ func main() {
 
 	// Create WebSocket server
 	wsServer := websocket.NewServer(*wsPort)
+	
+	// Connect conversation manager to WebSocket server
+	wsServer.SetConversationManager(capturer.GetConversationManager())
 	
 	// Start WebSocket server in background
 	go func() {
@@ -57,6 +71,10 @@ func main() {
 	go func() {
 		for packet := range packets {
 			wsServer.Broadcast(packet)
+			// Also broadcast conversation update if packet has conversation ID
+			if packet.ConversationID != "" {
+				wsServer.BroadcastConversationUpdate(packet.ConversationID)
+			}
 		}
 	}()
 
@@ -66,4 +84,25 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down Netty daemon...")
+}
+
+// getLocalIP returns the local IP address for the specified interface
+func getLocalIP(ifaceName string) (string, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return "", err
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", err
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			return ipnet.IP.String(), nil
+		}
+	}
+
+	return "", fmt.Errorf("no IPv4 address found for interface %s", ifaceName)
 }
