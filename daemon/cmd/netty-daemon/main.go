@@ -9,30 +9,48 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/google/gopacket/pcap"
 	"github.com/iolloyd/netty/daemon/internal/capture"
 	"github.com/iolloyd/netty/daemon/internal/websocket"
 )
 
 func main() {
 	var (
-		iface    = flag.String("i", "", "Network interface to monitor (required)")
-		wsPort   = flag.String("port", "8080", "WebSocket server port")
-		filter   = flag.String("f", "", "BPF filter expression")
-		verbose  = flag.Bool("v", false, "Enable verbose logging")
+		iface       = flag.String("i", "", "Network interface to monitor (required)")
+		wsPort      = flag.String("port", "8080", "WebSocket server port")
+		filter      = flag.String("f", "", "BPF filter expression")
+		verbose     = flag.Bool("v", false, "Enable verbose logging")
+		listIfaces  = flag.Bool("list", false, "List available network interfaces")
 	)
 	flag.Parse()
 
-	if *iface == "" {
-		log.Fatal("Network interface is required. Use -i flag to specify interface.")
+	// Handle interface listing
+	if *listIfaces {
+		listInterfaces()
+		return
 	}
 
+	if *iface == "" {
+		log.Println("ERROR: Network interface is required. Use -i flag to specify interface.")
+		log.Println("\nAvailable interfaces:")
+		listInterfaces()
+		os.Exit(1)
+	}
+
+	// Always show startup information
+	log.Println("Starting Netty daemon...")
+	log.Printf("Interface: %s", *iface)
+	log.Printf("WebSocket port: %s", *wsPort)
+	if *filter != "" {
+		log.Printf("Filter: %s", *filter)
+	}
+	log.Println("")
+
+	// List available interfaces for debugging
 	if *verbose {
-		log.Println("Starting Netty daemon...")
-		log.Printf("Interface: %s", *iface)
-		log.Printf("WebSocket port: %s", *wsPort)
-		if *filter != "" {
-			log.Printf("Filter: %s", *filter)
-		}
+		log.Println("Available interfaces:")
+		listInterfaces()
+		log.Println("")
 	}
 
 	// Get local IP address for the specified interface
@@ -56,6 +74,9 @@ func main() {
 	
 	// Connect conversation manager to WebSocket server
 	wsServer.SetConversationManager(capturer.GetConversationManager())
+	
+	// Connect capture statistics to WebSocket server
+	wsServer.SetStatsFunction(capturer.GetStats)
 	
 	// Start WebSocket server in background
 	go func() {
@@ -105,4 +126,66 @@ func getLocalIP(ifaceName string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no IPv4 address found for interface %s", ifaceName)
+}
+
+// listInterfaces lists all available network interfaces
+func listInterfaces() {
+	// Try using pcap.FindAllDevs first for more accurate results
+	devices, err := pcap.FindAllDevs()
+	if err == nil && len(devices) > 0 {
+		for _, device := range devices {
+			fmt.Printf("  %s", device.Name)
+			if device.Description != "" {
+				fmt.Printf(" - %s", device.Description)
+			}
+			
+			// Show IP addresses
+			var ips []string
+			for _, addr := range device.Addresses {
+				if addr.IP.To4() != nil {
+					ips = append(ips, addr.IP.String())
+				}
+			}
+			if len(ips) > 0 {
+				fmt.Printf(" [%v]", ips)
+			}
+			fmt.Println()
+		}
+	} else {
+		// Fallback to net.Interfaces if pcap fails
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			log.Printf("Failed to list interfaces: %v", err)
+			return
+		}
+		
+		for _, iface := range interfaces {
+			addrs, _ := iface.Addrs()
+			fmt.Printf("  %s", iface.Name)
+			
+			// Show status
+			if iface.Flags&net.FlagUp != 0 {
+				fmt.Print(" (UP)")
+			} else {
+				fmt.Print(" (DOWN)")
+			}
+			
+			// Show IP addresses
+			var ips []string
+			for _, addr := range addrs {
+				if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+					ips = append(ips, ipnet.IP.String())
+				}
+			}
+			if len(ips) > 0 {
+				fmt.Printf(" [%v]", ips)
+			}
+			fmt.Println()
+		}
+	}
+	
+	fmt.Println("\nCommon interface names:")
+	fmt.Println("  en0: Wi-Fi (macOS)")
+	fmt.Println("  en1: Ethernet (macOS)")
+	fmt.Println("  lo0: Loopback")
 }

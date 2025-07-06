@@ -20,6 +20,7 @@ type Server struct {
 	upgrader  websocket.Upgrader
 	mu        sync.RWMutex
 	convMgr   *conversation.Manager
+	statsFunc func() map[string]interface{} // Function to get capture statistics
 }
 
 type Client struct {
@@ -48,6 +49,11 @@ func NewServer(port string) *Server {
 // SetConversationManager sets the conversation manager for the server
 func (s *Server) SetConversationManager(mgr *conversation.Manager) {
 	s.convMgr = mgr
+}
+
+// SetStatsFunction sets the function to retrieve capture statistics
+func (s *Server) SetStatsFunction(fn func() map[string]interface{}) {
+	s.statsFunc = fn
 }
 
 func (s *Server) Start() error {
@@ -134,7 +140,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"clients": clientCount,
 	}
 
+	// Add capture statistics if available
+	if s.statsFunc != nil {
+		response["capture_stats"] = s.statsFunc()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // CORS for development
 	json.NewEncoder(w).Encode(response)
 }
 

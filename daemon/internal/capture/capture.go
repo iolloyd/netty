@@ -20,19 +20,26 @@ type PacketCapture struct {
 	filter      string
 	convMgr     *conversation.Manager
 	dnsResolver *resolver.DNSResolver
+	stats       *PacketStats
 }
 
 func NewPacketCapture(iface, filter, localIP string) (*PacketCapture, error) {
+	log.Printf("[DEBUG] Opening packet capture on interface: %s", iface)
 	handle, err := pcap.OpenLive(iface, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open interface %s: %w", iface, err)
 	}
+	log.Printf("[DEBUG] Successfully opened interface %s", iface)
 
 	if filter != "" {
+		log.Printf("[DEBUG] Setting BPF filter: %s", filter)
 		if err := handle.SetBPFFilter(filter); err != nil {
 			handle.Close()
 			return nil, fmt.Errorf("failed to set BPF filter: %w", err)
 		}
+		log.Printf("[DEBUG] BPF filter set successfully")
+	} else {
+		log.Printf("[DEBUG] No BPF filter specified, capturing all traffic")
 	}
 
 	// Create conversation manager with local IP
@@ -49,6 +56,7 @@ func NewPacketCapture(iface, filter, localIP string) (*PacketCapture, error) {
 		filter:      filter,
 		convMgr:     convMgr,
 		dnsResolver: dnsResolver,
+		stats:       NewPacketStats(),
 	}, nil
 }
 
@@ -58,17 +66,65 @@ func (pc *PacketCapture) Start() <-chan *models.NetworkEvent {
 	go func() {
 		defer close(events)
 		packetSource := gopacket.NewPacketSource(pc.handle, pc.handle.LinkType())
+		log.Printf("[DEBUG] Starting packet capture loop on interface %s", pc.iface)
 		
+		// Start a timer to check if we're receiving packets
+		noPacketTimer := time.NewTimer(10 * time.Second)
+		defer noPacketTimer.Stop()
+		
+		go func() {
+			<-noPacketTimer.C
+			stats := pc.stats.GetStats()
+			if stats["total_packets"].(uint64) == 0 {
+				log.Printf("[WARNING] No packets captured after 10 seconds on interface %s", pc.iface)
+				log.Printf("[WARNING] Possible issues:")
+				log.Printf("[WARNING]   - Wrong interface (use -list to see available interfaces)")
+				log.Printf("[WARNING]   - No network traffic on the interface")
+				log.Printf("[WARNING]   - BPF filter too restrictive")
+				log.Printf("[WARNING]   - Insufficient permissions (run with sudo)")
+				log.Printf("[WARNING] Try running: sudo tcpdump -i %s -c 10", pc.iface)
+			}
+		}()
+		
+		packetCount := 0
 		for packet := range packetSource.Packets() {
+			packetCount++
+			pc.stats.IncrementPackets()
+			pc.stats.IncrementBytes(uint64(len(packet.Data())))
+			pc.stats.UpdateLastPacketTime()
+			
+			// Reset timer on first packet
+			if packetCount == 1 {
+				noPacketTimer.Stop()
+				log.Printf("[INFO] Successfully capturing packets on interface %s", pc.iface)
+			}
+			
+			if packetCount%100 == 0 {
+				log.Printf("[DEBUG] Captured %d packets so far", packetCount)
+			}
 			event := pc.processPacket(packet)
 			if event != nil {
+				if packetCount <= 10 {
+					log.Printf("[DEBUG] Processed packet #%d: %s:%d -> %s:%d (%s)", 
+						packetCount, event.SourceIP, event.SourcePort, 
+						event.DestIP, event.DestPort, event.TransportProtocol)
+				}
 				// Process packet through conversation manager
 				pc.convMgr.ProcessEvent(event)
 				
 				select {
 				case events <- event:
+					pc.stats.IncrementProcessed()
+					if packetCount <= 10 {
+						log.Printf("[DEBUG] Event sent to channel successfully")
+					}
 				default:
-					log.Println("Event channel full, dropping packet")
+					pc.stats.IncrementDropped()
+					log.Println("[WARNING] Event channel full, dropping packet")
+				}
+			} else {
+				if packetCount <= 10 {
+					log.Printf("[DEBUG] Packet #%d: No network/transport layer found", packetCount)
 				}
 			}
 		}
@@ -78,6 +134,11 @@ func (pc *PacketCapture) Start() <-chan *models.NetworkEvent {
 }
 
 func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEvent {
+	// Only return nil if packet has no network or transport layer
+	if packet.NetworkLayer() == nil || packet.TransportLayer() == nil {
+		return nil
+	}
+	
 	event := &models.NetworkEvent{
 		Timestamp: time.Now(),
 		Interface: pc.iface,
@@ -104,6 +165,7 @@ func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEv
 			event.TransportProtocol = "TCP"
 			event.SourcePort = int(trans.SrcPort)
 			event.DestPort = int(trans.DstPort)
+			pc.stats.IncrementTCP()
 			
 			// Extract TCP flags
 			event.TCPFlags = &models.TCPPacketFlags{
@@ -147,6 +209,7 @@ func (pc *PacketCapture) processPacket(packet gopacket.Packet) *models.NetworkEv
 			event.TransportProtocol = "UDP"
 			event.SourcePort = int(trans.SrcPort)
 			event.DestPort = int(trans.DstPort)
+			pc.stats.IncrementUDP()
 			
 			// Use port heuristics for UDP
 			if trans.DstPort < 1024 || isCommonPort(int(trans.DstPort)) {
@@ -225,4 +288,9 @@ func guessAppProtocol(srcPort, dstPort int) string {
 		return proto
 	}
 	return ""
+}
+
+// GetStats returns packet capture statistics
+func (pc *PacketCapture) GetStats() map[string]interface{} {
+	return pc.stats.GetStats()
 }
