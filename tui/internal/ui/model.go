@@ -40,6 +40,7 @@ type ViewMode int
 const (
 	ViewModePackets ViewMode = iota
 	ViewModeConversations
+	ViewModePacketDetail
 )
 
 type Filter struct {
@@ -56,7 +57,7 @@ type Stats struct {
 }
 
 func NewModel(wsClient *websocket.Client) Model {
-	return Model{
+	m := Model{
 		wsClient:         wsClient,
 		events:           make([]models.NetworkEvent, 0, maxEvents),
 		filteredEvents:   make([]models.NetworkEvent, 0),
@@ -67,14 +68,27 @@ func NewModel(wsClient *websocket.Client) Model {
 		},
 		viewMode: ViewModePackets,
 	}
+	// Initialize filtered events
+	m.applyFilter()
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.wsClient.Connect(),
 		tea.EnterAltScreen,
+		tickCmd(),
 	)
 }
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+type tickMsg time.Time
+type reconnectMsg struct{}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -86,22 +100,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 	
+	case tickMsg:
+		// Continue ticking and waiting for events
+		var cmds []tea.Cmd
+		cmds = append(cmds, tickCmd())
+		// Always wait for events (including connection status updates)
+		cmds = append(cmds, m.wsClient.WaitForEvent())
+		return m, tea.Batch(cmds...)
+	
+	case reconnectMsg:
+		m.connectionStatus = "Reconnecting..."
+		return m, m.wsClient.Reconnect()
+	
 	case websocket.ConnectionStatusMsg:
 		m.connected = msg.Connected
 		if msg.Connected {
 			m.connectionStatus = "Connected"
 			m.connectionError = ""
-			return m, m.wsClient.WaitForEvent()
+			// Request initial conversation data
+			if m.viewMode == ViewModeConversations {
+				return m, m.requestConversations()
+			}
+			return m, nil
 		} else if msg.Error != nil {
 			m.connectionError = msg.Error.Error()
-			m.connectionStatus = fmt.Sprintf("Connection failed: %s", msg.Error.Error())
+			if strings.Contains(msg.Error.Error(), "connection lost") {
+				m.connectionStatus = "Connection lost. Reconnecting..."
+			} else {
+				m.connectionStatus = fmt.Sprintf("Connection failed: %s", msg.Error.Error())
+			}
 			// Attempt to reconnect after a delay
 			return m, tea.Sequence(
 				tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
-					m.connectionStatus = "Reconnecting..."
-					return nil
+					return reconnectMsg{}
 				}),
-				m.wsClient.Reconnect(),
 			)
 		}
 		return m, nil
@@ -114,9 +146,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Periodically request conversation updates
 		if time.Since(m.lastConvUpdate) > 2*time.Second && m.viewMode == ViewModeConversations {
 			m.lastConvUpdate = time.Now()
-			return m, tea.Batch(m.wsClient.WaitForEvent(), m.requestConversations())
+			return m, m.requestConversations()
 		}
-		return m, m.wsClient.WaitForEvent()
+		return m, nil
 	
 	case websocket.ConversationsMsg:
 		m.conversations = []models.Conversation(msg)
@@ -133,13 +165,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		// Don't quit if in detail view, just exit detail view
+		if m.viewMode == ViewModePacketDetail {
+			m.viewMode = ViewModePackets
+			return m, nil
+		}
 		return m, tea.Quit
 	
 	case "?", "h":
-		m.showHelp = !m.showHelp
+		// Don't show help in detail view
+		if m.viewMode != ViewModePacketDetail {
+			m.showHelp = !m.showHelp
+		}
+		return m, nil
+	
+	case "enter":
+		// Show detail view for selected packet
+		if m.viewMode == ViewModePackets && len(m.filteredEvents) > 0 {
+			m.viewMode = ViewModePacketDetail
+		}
+		return m, nil
+	
+	case "esc":
+		// Exit detail view
+		if m.viewMode == ViewModePacketDetail {
+			m.viewMode = ViewModePackets
+		}
 		return m, nil
 	
 	case "j", "down":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		maxItems := len(m.filteredEvents) - 1
 		if m.viewMode == ViewModeConversations {
 			maxItems = len(m.conversations) - 1
@@ -151,6 +209,10 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	
 	case "k", "up":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		if m.selectedIndex > 0 {
 			m.selectedIndex--
 			m.ensureSelectedVisible()
@@ -158,6 +220,10 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	
 	case "G":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		if m.viewMode == ViewModePackets {
 			m.selectedIndex = len(m.filteredEvents) - 1
 		} else {
@@ -167,27 +233,51 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	
 	case "g":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		m.selectedIndex = 0
 		m.scrollOffset = 0
 		return m, nil
 	
 	case "ctrl+d":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		m.scrollDown(m.height / 2)
 		return m, nil
 	
 	case "ctrl+u":
+		// Don't navigate in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		m.scrollUp(m.height / 2)
 		return m, nil
 	
 	case "c":
+		// Don't clear in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		m.clearEvents()
 		return m, nil
 	
 	case "f":
+		// Don't filter in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		// TODO: Implement filter dialog
 		return m, nil
 	
 	case "tab":
+		// Don't switch view modes in detail view
+		if m.viewMode == ViewModePacketDetail {
+			return m, nil
+		}
 		// Toggle between packets and conversations view
 		if m.viewMode == ViewModePackets {
 			m.viewMode = ViewModeConversations
@@ -325,8 +415,10 @@ func (m Model) View() string {
 	
 	if m.viewMode == ViewModePackets {
 		s.WriteString(m.renderEventList())
-	} else {
+	} else if m.viewMode == ViewModeConversations {
 		s.WriteString(m.renderConversationList())
+	} else if m.viewMode == ViewModePacketDetail {
+		s.WriteString(m.renderEventDetail())
 	}
 	
 	s.WriteString("\n")
@@ -484,7 +576,7 @@ func (m *Model) renderEventLine(event models.NetworkEvent, selected bool) string
 		event.SourcePort,
 		truncateString(destDisplay, 25),
 		event.DestPort,
-		event.Protocol,
+		event.TransportProtocol,
 		formatBytes(event.Size),
 	)
 	
@@ -507,9 +599,11 @@ func (m *Model) renderEventLine(event models.NetworkEvent, selected bool) string
 func (m *Model) renderFooter() string {
 	var help string
 	if m.viewMode == ViewModePackets {
-		help = " q:quit | ?:help | j/k:navigate | c:clear | f:filter | tab:conversations "
-	} else {
+		help = " q:quit | ?:help | j/k:navigate | enter:details | c:clear | f:filter | tab:conversations "
+	} else if m.viewMode == ViewModeConversations {
 		help = " q:quit | ?:help | j/k:navigate | tab:packets "
+	} else if m.viewMode == ViewModePacketDetail {
+		help = " esc:back | q:back "
 	}
 	
 	return lipgloss.NewStyle().
@@ -683,4 +777,133 @@ func (m *Model) requestConversations() tea.Cmd {
 		}
 		return nil
 	}
+}
+
+// renderEventDetail renders detailed information about a selected event
+func (m *Model) renderEventDetail() string {
+	if m.selectedIndex < 0 || m.selectedIndex >= len(m.filteredEvents) {
+		return "No event selected"
+	}
+	
+	event := m.filteredEvents[m.selectedIndex]
+	
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	sectionStyle := lipgloss.NewStyle().Padding(1, 2)
+	
+	var details strings.Builder
+	
+	// Title
+	details.WriteString(titleStyle.Render("Network Event Details"))
+	details.WriteString("\n\n")
+	
+	// Basic Information
+	details.WriteString(sectionStyle.Render(
+		labelStyle.Render("Timestamp: ") + valueStyle.Render(event.Timestamp.Format("2006-01-02 15:04:05.000 MST")) + "\n" +
+		labelStyle.Render("Interface: ") + valueStyle.Render(event.Interface) + "\n" +
+		labelStyle.Render("Direction: ") + valueStyle.Render(event.Direction) + "\n" +
+		labelStyle.Render("Size: ") + valueStyle.Render(formatBytes(event.Size)) + "\n",
+	))
+	
+	// Network Layer
+	details.WriteString("\n" + titleStyle.Render("Network Layer") + "\n")
+	details.WriteString(sectionStyle.Render(
+		labelStyle.Render("Protocol: ") + valueStyle.Render(event.Protocol) + "\n" +
+		labelStyle.Render("Source IP: ") + valueStyle.Render(event.SourceIP) + "\n" +
+		labelStyle.Render("Destination IP: ") + valueStyle.Render(event.DestIP) + "\n",
+	))
+	
+	// Hostname Resolution
+	if event.SourceHostname != "" || event.DestHostname != "" {
+		details.WriteString("\n" + titleStyle.Render("Hostname Resolution") + "\n")
+		if event.SourceHostname != "" && event.SourceHostname != event.SourceIP {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("Source Hostname: ") + valueStyle.Render(event.SourceHostname) + "\n",
+			))
+		}
+		if event.DestHostname != "" && event.DestHostname != event.DestIP {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("Destination Hostname: ") + valueStyle.Render(event.DestHostname) + "\n",
+			))
+		}
+	}
+	
+	// Transport Layer
+	details.WriteString("\n" + titleStyle.Render("Transport Layer") + "\n")
+	details.WriteString(sectionStyle.Render(
+		labelStyle.Render("Protocol: ") + valueStyle.Render(event.TransportProtocol) + "\n" +
+		labelStyle.Render("Source Port: ") + valueStyle.Render(fmt.Sprintf("%d", event.SourcePort)) + "\n" +
+		labelStyle.Render("Destination Port: ") + valueStyle.Render(fmt.Sprintf("%d", event.DestPort)) + "\n",
+	))
+	
+	// TCP Flags (if applicable)
+	if event.TCPFlags != nil {
+		var flags []string
+		if event.TCPFlags.SYN { flags = append(flags, "SYN") }
+		if event.TCPFlags.ACK { flags = append(flags, "ACK") }
+		if event.TCPFlags.FIN { flags = append(flags, "FIN") }
+		if event.TCPFlags.RST { flags = append(flags, "RST") }
+		if event.TCPFlags.PSH { flags = append(flags, "PSH") }
+		if event.TCPFlags.URG { flags = append(flags, "URG") }
+		
+		if len(flags) > 0 {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("TCP Flags: ") + valueStyle.Render(strings.Join(flags, ", ")) + "\n",
+			))
+		}
+		
+		if event.SequenceNumber > 0 || event.AckNumber > 0 {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("Sequence Number: ") + valueStyle.Render(fmt.Sprintf("%d", event.SequenceNumber)) + "\n" +
+				labelStyle.Render("Acknowledgment Number: ") + valueStyle.Render(fmt.Sprintf("%d", event.AckNumber)) + "\n",
+			))
+		}
+	}
+	
+	// Application Layer
+	if event.AppProtocol != "" || event.TLSServerName != "" {
+		details.WriteString("\n" + titleStyle.Render("Application Layer") + "\n")
+		if event.AppProtocol != "" {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("Protocol: ") + valueStyle.Render(event.AppProtocol) + "\n",
+			))
+		}
+		if event.TLSServerName != "" {
+			details.WriteString(sectionStyle.Render(
+				labelStyle.Render("TLS Server Name (SNI): ") + valueStyle.Render(event.TLSServerName) + "\n",
+			))
+		}
+	}
+	
+	// Conversation Tracking
+	if event.ConversationID != "" {
+		details.WriteString("\n" + titleStyle.Render("Conversation") + "\n")
+		details.WriteString(sectionStyle.Render(
+			labelStyle.Render("ID: ") + valueStyle.Render(event.ConversationID) + "\n",
+		))
+	}
+	
+	// Center the content
+	content := details.String()
+	lines := strings.Split(content, "\n")
+	maxWidth := 0
+	for _, line := range lines {
+		if w := lipgloss.Width(line); w > maxWidth {
+			maxWidth = w
+		}
+	}
+	
+	// Create a box around the details
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(1, 2).
+		Width(maxWidth + 6)
+	
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.viewportHeight()).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(boxStyle.Render(content))
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,7 +32,5 @@ func main() {
 	}
 
 	// Clean up
-	if err := wsClient.Close(); err != nil {
-		log.Printf("Error closing WebSocket connection: %v", err)
-	}
+	wsClient.Close()
 }
