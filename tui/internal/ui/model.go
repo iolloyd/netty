@@ -474,7 +474,7 @@ func (m *Model) renderStats() string {
 	var stats string
 	if m.viewMode == ViewModePackets {
 		stats = fmt.Sprintf(
-			" Packets: %d | Bytes: %s | Events: %d/%d",
+			" [PACKETS VIEW] Packets: %d | Bytes: %s | Events: %d/%d",
 			m.stats.TotalPackets,
 			formatBytes(m.stats.TotalBytes),
 			len(m.filteredEvents),
@@ -488,7 +488,7 @@ func (m *Model) renderStats() string {
 			}
 		}
 		stats = fmt.Sprintf(
-			" Conversations: %d active / %d total | Packets: %d | Bytes: %s",
+			" [CONVERSATIONS VIEW] Active: %d / Total: %d | Packets: %d | Bytes: %s",
 			activeCount,
 			len(m.conversations),
 			m.stats.TotalPackets,
@@ -601,7 +601,7 @@ func (m *Model) renderFooter() string {
 	if m.viewMode == ViewModePackets {
 		help = " q:quit | ?:help | j/k:navigate | enter:details | c:clear | f:filter | tab:conversations "
 	} else if m.viewMode == ViewModeConversations {
-		help = " q:quit | ?:help | j/k:navigate | tab:packets "
+		help = " q:quit | ?:help | j/k:navigate | tab:switch to packets view "
 	} else if m.viewMode == ViewModePacketDetail {
 		help = " esc:back | q:back "
 	}

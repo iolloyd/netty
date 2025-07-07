@@ -72,6 +72,11 @@ func (c *Client) Connect() tea.Cmd {
 
 func (c *Client) readMessages() {
 	defer func() {
+		// Recover from any panic
+		if r := recover(); r != nil {
+			// Silently handle panic
+		}
+		
 		c.mu.Lock()
 		if c.conn != nil {
 			c.conn.Close()
@@ -92,10 +97,19 @@ func (c *Client) readMessages() {
 		case <-c.stopRead:
 			return
 		default:
-			// Set read deadline to allow periodic checks
-			c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			// Check if connection exists
+			c.mu.Lock()
+			if c.conn == nil {
+				c.mu.Unlock()
+				return
+			}
+			conn := c.conn
+			c.mu.Unlock()
 			
-			_, message, err := c.conn.ReadMessage()
+			// Set read deadline to allow periodic checks
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				// Check if it's a timeout (which is expected)
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -193,10 +207,10 @@ func (c *Client) Close() error {
 	}
 	
 	if c.conn != nil {
-		err := c.conn.Close()
+		// Ignore close errors - connection might already be closed
+		c.conn.Close()
 		c.conn = nil
 		c.isConnected = false
-		return err
 	}
 	return nil
 }

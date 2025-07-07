@@ -27,6 +27,8 @@ type Client struct {
 	conn   *websocket.Conn
 	send   chan []byte
 	server *Server
+	mu     sync.Mutex
+	closed bool
 }
 
 func NewServer(port string) *Server {
@@ -44,6 +46,13 @@ func NewServer(port string) *Server {
 			},
 		},
 	}
+}
+
+// getClientCount returns the current number of connected clients
+func (s *Server) getClientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.clients)
 }
 
 // SetConversationManager sets the conversation manager for the server
@@ -81,9 +90,17 @@ func (s *Server) run() {
 			s.mu.Lock()
 			if _, ok := s.clients[client]; ok {
 				delete(s.clients, client)
-				close(client.send)
 				s.mu.Unlock()
-				log.Printf("Client disconnected. Total clients: %d", len(s.clients))
+				
+				// Close the client's send channel safely
+				client.mu.Lock()
+				if !client.closed {
+					client.closed = true
+					close(client.send)
+				}
+				client.mu.Unlock()
+				
+				log.Printf("Client disconnected. Total clients: %d", s.getClientCount())
 			} else {
 				s.mu.Unlock()
 			}
@@ -97,14 +114,10 @@ func (s *Server) run() {
 			s.mu.RUnlock()
 
 			for _, client := range clientsCopy {
-				select {
-				case client.send <- message:
-				default:
-					// Client's send channel is full, close it
-					s.mu.Lock()
-					delete(s.clients, client)
-					s.mu.Unlock()
-					close(client.send)
+				// Use safeSend to avoid panic
+				if !client.safeSend(message) {
+					// Client's send channel is full or closed, unregister it
+					s.unregister <- client
 				}
 			}
 		}
@@ -151,6 +164,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Broadcast(event *models.NetworkEvent) {
+	// Debug log
+	// Event broadcast is handled silently
+	
 	// Wrap event in a message type
 	message := struct {
 		Type string               `json:"type"`
@@ -168,6 +184,7 @@ func (s *Server) Broadcast(event *models.NetworkEvent) {
 
 	select {
 	case s.broadcast <- data:
+		// Event queued successfully
 	default:
 		log.Println("Broadcast channel full, dropping event")
 	}
@@ -226,8 +243,32 @@ func (c *Client) readPump() {
 	}
 }
 
+// safeSend safely sends data to the client, checking if the channel is closed
+func (c *Client) safeSend(data []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if c.closed {
+		return false
+	}
+	
+	select {
+	case c.send <- data:
+		return true
+	default:
+		// Channel is full
+		return false
+	}
+}
+
 // handleCommand processes commands from clients
 func (c *Client) handleCommand(message []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Silently handle panic
+		}
+	}()
+	
 	var cmd struct {
 		Type string `json:"type"`
 		Data json.RawMessage `json:"data"`
@@ -251,11 +292,7 @@ func (c *Client) handleCommand(message []byte) {
 			}
 			
 			if data, err := json.Marshal(response); err == nil {
-				select {
-				case c.send <- data:
-				default:
-					// Client send channel full
-				}
+				c.safeSend(data)
 			}
 		}
 	
@@ -272,11 +309,7 @@ func (c *Client) handleCommand(message []byte) {
 			}
 			
 			if data, err := json.Marshal(response); err == nil {
-				select {
-				case c.send <- data:
-				default:
-					// Client send channel full
-				}
+				c.safeSend(data)
 			}
 		}
 	
@@ -296,11 +329,7 @@ func (c *Client) handleCommand(message []byte) {
 				}
 				
 				if data, err := json.Marshal(response); err == nil {
-					select {
-					case c.send <- data:
-					default:
-						// Client send channel full
-					}
+					c.safeSend(data)
 				}
 			}
 		}
@@ -308,7 +337,12 @@ func (c *Client) handleCommand(message []byte) {
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			// Silently handle panic
+		}
+		c.conn.Close()
+	}()
 
 	for {
 		select {
@@ -318,7 +352,10 @@ func (c *Client) writePump() {
 				return
 			}
 
-			c.conn.WriteMessage(websocket.TextMessage, message)
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				// Write error handled silently
+				return
+			}
 		}
 	}
 }

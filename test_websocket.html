@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+</head>
+<body>
+    <h1>WebSocket Test</h1>
+    <div id="messages"></div>
+    <script>
+        const ws = new WebSocket('ws://localhost:8080/ws');
+        const messagesDiv = document.getElementById('messages');
+        let messageCount = 0;
+
+        ws.onopen = function() {
+            console.log('Connected to WebSocket');
+            messagesDiv.innerHTML += '<p>Connected to WebSocket</p>';
+        };
+
+        ws.onmessage = function(event) {
+            messageCount++;
+            console.log('Message received:', event.data);
+            const msg = JSON.parse(event.data);
+            messagesDiv.innerHTML += `<p>Message ${messageCount}: ${msg.type} - ${JSON.stringify(msg.data).substring(0, 100)}...</p>`;
+        };
+
+        ws.onerror = function(error) {
+            console.error('WebSocket error:', error);
+            messagesDiv.innerHTML += '<p>Error: ' + error + '</p>';
+        };
+
+        ws.onclose = function() {
+            console.log('WebSocket closed');
+            messagesDiv.innerHTML += '<p>WebSocket closed</p>';
+        };
+    </script>
+</body>
+</html>
